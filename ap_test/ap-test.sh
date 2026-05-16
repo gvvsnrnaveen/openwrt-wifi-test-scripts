@@ -9,13 +9,16 @@
 # Configuration
 INTERFACE="ath0"
 CONFIG_PATH="wireless.wifi0"
-BAND="2"
-WAIT_TIME=5
+IFACE_CONFIG_PATH="wireless.wifinet0"
+WAIT_TIME=2
 
 # Define parameters (space-separated strings for sh compatibility)
 hwmodes="11axa 11ac 11na 11a"
 htmodes="HT20 HT40"
-channels="184 188 20 21 22 23 24 25 26 27 28"
+freq_channels="183 184 185 186 187 188 189 190 191 192 193 194 195 196 197"
+a_only_channels="83 84 85 86 87 88 89 90 91 92 93 94 95 96"
+chanbw="1 2"
+rule1_chanbw="0"
 
 # Output CSV file
 csv_file="wireless_test_results.csv"
@@ -37,25 +40,6 @@ check_root() {
 }
 
 #############################################################################
-# Function: Map channel to country code
-#############################################################################
-get_country_for_channel() {
-    local channel=$1
-
-    case "$channel" in
-        184|188)
-            echo "JP"
-            ;;
-        20|21|22|23|24|25|26|27|28)
-            echo "US"
-            ;;
-        *)
-            echo ""
-            ;;
-    esac
-}
-
-#############################################################################
 # Function: Check if interface exists
 #############################################################################
 check_interface() {
@@ -71,7 +55,7 @@ check_interface() {
 # Function: Write CSV header
 #############################################################################
 write_csv_header() {
-    echo "channel,hwmode,htmode,status,iwconfig_info" > "$csv_file"
+    echo "channel,hwmode,htmode,chanbw,status,iwconfig_info" > "$csv_file"
 }
 
 #############################################################################
@@ -81,17 +65,23 @@ set_wireless_params() {
     local hwmode=$1
     local htmode=$2
     local channel=$3
-    local country
-
-    country=$(get_country_for_channel "$channel")
+    local chanbw_val=$4
 
     uci set "${CONFIG_PATH}.hwmode=${hwmode}" 2>/dev/null
-    uci set "${CONFIG_PATH}.htmode=${htmode}" 2>/dev/null
-    uci set "${CONFIG_PATH}.band=${BAND}" 2>/dev/null
-    uci set "${CONFIG_PATH}.channel=${channel}" 2>/dev/null
-    if [ -n "$country" ]; then
-        uci set "${CONFIG_PATH}.country=${country}" 2>/dev/null
+
+    if [ -n "$htmode" ]; then
+        uci set "${CONFIG_PATH}.htmode=${htmode}" 2>/dev/null
+    else
+        uci delete "${CONFIG_PATH}.htmode" 2>/dev/null
     fi
+
+    if [ -n "$chanbw_val" ]; then
+        uci set "${IFACE_CONFIG_PATH}.chanbw=${chanbw_val}" 2>/dev/null
+    else
+        uci delete "${IFACE_CONFIG_PATH}.chanbw" 2>/dev/null
+    fi
+
+    uci set "${CONFIG_PATH}.channel=${channel}" 2>/dev/null
     uci commit 2>/dev/null
 }
 
@@ -162,18 +152,27 @@ write_csv_header
 # Count items in each parameter set
 hwmode_count=$(echo "$hwmodes" | wc -w)
 htmode_count=$(echo "$htmodes" | wc -w)
-channel_count=$(echo "$channels" | wc -w)
-total=$((hwmode_count * htmode_count * channel_count))
+freq_channel_count=$(echo "$freq_channels" | wc -w)
+a_only_channel_count=$(echo "$a_only_channels" | wc -w)
+chanbw_count=$(echo "$chanbw" | wc -w)
+
+# Rule 1: (11axa|11ac|11na|11a) x (HT20|HT40) x (183-197), chanbw=0
+rule1_total=$((hwmode_count * htmode_count * freq_channel_count))
+# Rule 2: (11a only) x (chanbw 1|2) x (83-98), with no htmode
+rule2_total=$((a_only_channel_count * chanbw_count))
+total=$((rule1_total + rule2_total))
 current=0
 working_count=0
 not_working_count=0
 
 echo "Configuration:"
 echo "  Interface: $INTERFACE"
-echo "  Band: $BAND"
 echo "  HW Modes: $hwmodes"
 echo "  HT Modes: $htmodes"
-echo "  Channels: $channels"
+echo "  Rule 1 Channels (183-197): $freq_channels"
+echo "  Rule 1 ChanBW (183-197): $rule1_chanbw"
+echo "  Rule 2 Channels (83-98, 11a + chanbw 1/2, no htmode): $a_only_channels"
+echo "  ChanBW values: $chanbw"
 echo "  Wait time between tests: ${WAIT_TIME}s"
 echo ""
 echo "Total combinations to test: $total"
@@ -182,16 +181,45 @@ echo "Starting tests..."
 echo "────────────────────────────────────────────────────────────────"
 echo ""
 
-# Iterate through all combinations
+# Rule 2 combinations:
+# Channels 83-98 on 11a only with chanbw 1/2 and no htmode
+for channel in $a_only_channels; do
+    for bw in $chanbw; do
+        current=$((current+1))
+        printf "[%3d/%3d] hwmode=%-6s htmode=%-5s chanbw=%-1s channel=%-3s ... " "$current" "$total" "11a" "-" "$bw" "$channel"
+
+        # htmode intentionally unset in this rule
+        set_wireless_params "11a" "" "$channel" "$bw"
+
+        apply_and_wait
+
+        iwconfig_output=$(get_iwconfig_info)
+        status=$(check_status "$iwconfig_output")
+        iwconfig_info=$(format_iwconfig_for_csv "$iwconfig_output")
+
+        echo "$channel,11a,,$bw,$status,\"$iwconfig_info\"" >> "$csv_file"
+
+        if [ "$status" = "Working" ]; then
+            printf "${GREEN}✓ Working${NC}\n"
+            working_count=$((working_count+1))
+        else
+            printf "${RED}✗ Not Working${NC}\n"
+            not_working_count=$((not_working_count+1))
+        fi
+    done
+done
+
+# Rule 1 combinations:
+# 11axa/11ac/11na/11a with channels 183-197 and HT20/HT40 (chanbw=0)
 for hwmode in $hwmodes; do
     for htmode in $htmodes; do
-        for channel in $channels; do
+        for channel in $freq_channels; do
             current=$((current+1))
             # Display progress
-            printf "[%3d/%3d] hwmode=%-6s htmode=%-5s channel=%-2s ... " "$current" "$total" "$hwmode" "$htmode" "$channel"
+            printf "[%3d/%3d] hwmode=%-6s htmode=%-5s chanbw=%-1s channel=%-3s ... " "$current" "$total" "$hwmode" "$htmode" "$rule1_chanbw" "$channel"
 
             # Set wireless parameters
-            set_wireless_params "$hwmode" "$htmode" "$channel"
+            set_wireless_params "$hwmode" "$htmode" "$channel" "$rule1_chanbw"
 
             # Apply settings and wait
             apply_and_wait
@@ -206,7 +234,7 @@ for hwmode in $hwmodes; do
             iwconfig_info=$(format_iwconfig_for_csv "$iwconfig_output")
 
             # Write to CSV
-            echo "$channel,$hwmode,$htmode,$status,\"$iwconfig_info\"" >> "$csv_file"
+            echo "$channel,$hwmode,$htmode,$rule1_chanbw,$status,\"$iwconfig_info\"" >> "$csv_file"
 
             # Update counters and display result
             if [ "$status" = "Working" ]; then
